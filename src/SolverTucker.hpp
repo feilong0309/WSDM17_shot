@@ -9,6 +9,7 @@
 #include "RevEigSolver.hpp"
 #include "Option.hpp"
 
+
 using namespace std;
 
 template <typename Tuple>
@@ -35,6 +36,8 @@ protected:
 
 	uint smallit;
 public:
+	int *firstupdate;
+
 	SolverTuckerLS(uint inMode, TensorIndexWithMultipleFile<Tuple>* inPtrIndex, RowDenseMatrix *inFactMat)
 					: mode(inMode), arProb(nullptr), eigValues(nullptr), ptrIndex(inPtrIndex), factMat(inFactMat) {}
 
@@ -53,15 +56,18 @@ public:
 		vNewAVX.resize(lenV);
 		eigValues = new PRECISION[Option::szRank[mode]];
 		memset(eigValues, 0, Option::szRank[mode]*sizeof(PRECISION));
+		firstupdate = new int[Option::BLOCK];
 	}
 
 	double doIter()
 	{
 		lenV = this->getLenV(); 
+		printf("this2%d\n", lenV);
 		smallit = 0;
 
 		arProb->Restart();
 		arProb->TakeStep();
+		memset(firstupdate, 0, Option::BLOCK*sizeof(int));
 		while (!arProb->ArnoldiBasisFound())
 		{
 			PRECISION* vOld = arProb->GetVector();
@@ -107,6 +113,7 @@ public:
 template <typename Tuple>
 class SolverTransLS : public SolverTuckerLS<Tuple>
 {
+public:
 	SecureDenseVector 					*segVNew;
 	SecureDenseVector					*tempMat;
 	bool								initFlag;
@@ -140,6 +147,7 @@ public:
 		for (uint i = 0; i < Option::szMode; i++)
 			if (i != mode)
 				lenV = lenV * Option::szRank[i];
+		printf("getlenV %d\n", lenV);
 		return lenV;
 	}
 
@@ -177,11 +185,13 @@ public:
 					rowVec.resize(lenV, 0);
 				}
 
+			if(temp.dim[mode]>=Option::BLOCK) {
 				tempVec.resize(1, temp.value);
 				for (uint mIter = 0; mIter < Option::szMode; mIter++)
 					if (mIter != mode)
 						tempVec.outerProd(factMat[mIter].getVec(temp.dim[mIter]), Option::szRank[mIter]);
 				rowVec.acc(tempVec);
+			}
 			}
 			if (-1 != lastRowID){
 				row_dot_wold = innerProd(rowVec, vOld);
@@ -251,11 +261,13 @@ public:
 					rowVec.resize(lenV, 0);
 				}
 
+			if(temp.dim[mode]>=Option::BLOCK) {
 				tempVec.resize(1, temp.value);
 				for (uint mIter = 0; mIter < Option::szMode; mIter++)
 					if (mIter != mode)
 						tempVec.outerProd(factMat[mIter].getVec(temp.dim[mIter]), Option::szRank[mIter]);
 				rowVec.acc(tempVec);
+			}
 			}
 			if (-1 != lastRowID){
 				for (uint j = 0; j < szEigVec; j++){
@@ -409,6 +421,138 @@ public:
 };
 
 
+template <typename Tuple>
+class SolverBlockLS : public SolverTransLS<Tuple>
+{
+
+	//SecureDenseVector 					*segVNew;
+	//SecureDenseVector					*tempMat;
+	bool								initFlag;
+	using SolverTransLS<Tuple>::segVNew;
+	using SolverTransLS<Tuple>::tempMat;
+
+	typedef typename TensorIndexWithMultipleFile<Tuple>::Scanner Scanner;
+	using SolverTransLS<Tuple>::mode;
+	using SolverTransLS<Tuple>::nconv;
+	using SolverTransLS<Tuple>::lenV;
+	using SolverTransLS<Tuple>::arProb;
+	using SolverTransLS<Tuple>::ptrIndex;
+	using SolverTransLS<Tuple>::factMat;
+	using SolverTransLS<Tuple>::smallit;
+	using SolverTuckerLS<Tuple>::firstupdate;
+
+       SecureDenseVector* buffer;
+public:
+//SecureDenseVector *TempVecs = new SecureDenseVector(lenV)[50];
+	SolverBlockLS(uint inMode, TensorIndexWithMultipleFile<Tuple>* inPtrIndex, RowDenseMatrix *inFactMat)
+					: SolverTransLS<Tuple>(inMode, inPtrIndex, inFactMat), initFlag(true)
+	{
+		tempMat = new SecureDenseVector[Option::szRank[mode]];
+		segVNew = new SecureDenseVector[Option::szThread];
+		buffer = new SecureDenseVector[Option::BLOCK];
+		lenV=this->getLenV();
+		printf("this%d\n", lenV);
+		for(int i=0; i<Option::BLOCK; i++) {printf("I am here\n"); buffer[i].resize(lenV, 0); /* buffer[i]=SecureDenseVector(lenV);*/ /*buffer[i].resize(lenV, 1);*/ }
+		//for(int i=0; i<10; i++) buffer[i]=new SecureDenseVector[Option::szRank[mode]];
+	}
+
+	~SolverBlockLS()
+	{
+		delete[] tempMat;
+		delete[] segVNew;
+		delete[] buffer;
+	}
+
+	void updatev(PRECISION *vOld, PRECISION *vNew)
+	{
+		// Update an arnoldi vector.
+		//for(int i=0; i<BLOCK; i++) { buffer[i].resize(lenV, 0); /* buffer[i]=SecureDenseVector(lenV);*/ /*buffer[i].resize(lenV, 1);*/ }
+
+		Scanner::setMode(mode);
+		uint szRow = 0;
+		#pragma omp parallel for num_threads(Option::szThread)
+		for (int tid = 0; tid < Option::szThread; tid++)
+		{
+		uint nnz = 0;
+		uint skipp=0;
+			segVNew[tid].resize(lenV, 0);
+			Tuple temp;
+			int lastRowID = -1;
+			PRECISION row_dot_wold;
+			SecureDenseVector rowVec(lenV);
+			SecureDenseVector tempVec(lenV);
+			Scanner scan(ptrIndex);
+			scan.rewind();
+			while(scan.getNext(temp))
+			{
+				nnz++;
+				//printf("%f\n", temp.value);
+				if (lastRowID != temp.dim[mode])
+				{
+					if (-1 != lastRowID)
+					{	// When a rowVec is finalized.
+					   	//if(temp.dim[mode]<BLOCK) rowVec=buffer[temp.dim[mode]];
+					   	//printf("done %d\n", temp.dim[mode]);
+						row_dot_wold = innerProd(rowVec, vOld);
+						segVNew[tid].acc(row_dot_wold, rowVec);
+						szRow++;
+					   	//printf("done %d\n", temp.dim[mode]);
+					}
+
+					// Init variables for next it.
+					lastRowID = temp.dim[mode];
+					rowVec.resize(lenV, 0);
+				}
+			if(temp.dim[mode]>=Option::BLOCK) {
+				skipp++;
+				tempVec.resize(1, temp.value);
+				for (uint mIter = 0; mIter < Option::szMode; mIter++)
+					if (mIter != mode)
+						tempVec.outerProd(factMat[mIter].getVec(temp.dim[mIter]), Option::szRank[mIter]);
+				rowVec.acc(tempVec);
+			 } else
+				if(firstupdate[temp.dim[mode]]==0) {
+				skipp++;
+				firstupdate[temp.dim[mode]]=1;
+				tempVec.resize(1, temp.value);
+				for (uint mIter = 0; mIter < Option::szMode; mIter++)
+					if (mIter != mode)
+						tempVec.outerProd(factMat[mIter].getVec(temp.dim[mIter]), Option::szRank[mIter]);
+				rowVec.acc(tempVec);
+				} else{
+
+				}
+			}
+			if (-1 != lastRowID){
+				row_dot_wold = innerProd(rowVec, vOld);
+				segVNew[tid].acc(row_dot_wold, rowVec);
+				szRow++;
+			}
+			printf("nnz %d %d %d\n", nnz, skipp, Option::BLOCK);
+		}
+
+		// Aggregating results from multiple threads.
+		//memset(vNew, 0, sizeof(PRECISION)*lenV);
+		//for (int tid = 0; tid < Option::szThread; tid++)
+		//	for (int j = 0; j < lenV; j++)
+		//		vNew[j] += segVNew[tid][j];
+
+
+		return;
+
+
+	}
+
+	void storeSol(){
+
+
+	}
+
+};
+
+//template<typename Tuple>
+//int SolverTuckerLS<Tuple>::firstupdate=0;
+
 template<typename Tuple>
 class SolverTuckerFact
 {
@@ -454,15 +598,19 @@ public:
 
 			oldFactMat[mode].init(Option::szDim[mode], Option::szRank[mode]);
 
-			if (M_SCAN == Option::flagMethod)
+			cout<<"before"<<endl;
+			if (M_SCAN == Option::flagMethod) {
 				solv[mode] = new SolverTransLS<Tuple>(mode, ptrIndex, factMat);
+				cout << "scan"<<endl;
+			}
 
-			else if (M_PLAIN == Option::flagMethod)
+			else if (M_PLAIN == Option::flagMethod){
 				solv[mode] = new SolverRowLS<Tuple>(mode, ptrIndex, factMat);
+				cout << "plain" <<endl;
+			}
 			else { 
-				cout << "Hybrid version is not developed yet :) Sorry" << endl;
-				exit(0);
-				;
+				cout << "Hybrid version" << endl;
+				solv[mode] = new SolverBlockLS<Tuple>(mode, ptrIndex, factMat);
 			}
 			solv[mode]->init();
 		}
@@ -477,6 +625,7 @@ public:
 		double modelLoss(0);
 		double startTimeEval, evalTime(0);
 		double startTime = GetTickCount();
+		double gett(0);
 		cout << "Learning starts with " << Option::szThread << " threads " << endl;
 		if (TC_ITER == Option::flagCondTerminal && 0 == Option::maxIteration)
 			return;
@@ -485,10 +634,14 @@ public:
 		bool loopFlag = true;
 		while (loopFlag){
 			//eigValueChange = 0;
+			printf("here\n");
+			startTime = GetTickCount();
 			for (int mode = 0; mode < Option::szMode; mode++){
 				solv[mode]->doIter();
 				//eigValueChange += solv[mode]->doIter() / Option::szMode;
 			}
+			gett+= (GetTickCount() - startTime)/1000; 
+			printf("here\n");
 			
 			oldLoss = newLoss;
 			startTimeEval = GetTickCount();
@@ -501,15 +654,23 @@ public:
 			evalTime += GetTickCount() - startTimeEval;
 
 			it++;
-			if (TC_ITER == Option::flagCondTerminal)
+			if (TC_ITER == Option::flagCondTerminal) {
 				loopFlag = it < Option::maxIteration;
-			else if (TC_EPSILON == Option::flagCondTerminal)
+				cout<< "here1"<<Option::maxIteration<<endl;
+                        }
+			else if (TC_EPSILON == Option::flagCondTerminal) {
 				loopFlag = (lossChange > Option::epsilon) || it <= 1;
-			else
+				cout<< "here2"<<endl;
+			}
+			else {
 				loopFlag = (it < Option::maxIteration && lossChange > Option::epsilon) || it <= 1;
+				cout<< "here3"<<endl;
+			}
 
-			cout << "Iter#" << it << "\t\t" << (GetTickCount() - startTime)/1000 << "\t\t"
+			//cout << "Iter#" << it << "\t\t" << (GetTickCount() - startTime)/1000 << "\t\t"
+			cout << "Iter#" << it << "\t\t" <<gett<< "\t\t"
 					<<  lossChange << "\t" << endl;
+			cout<<loopFlag<<endl;
 		}
 		cout << "\nElapsed time summary - " << endl;
 		cout << "\tdecomposition:\t" << (GetTickCount() - startTime)/1000 << endl;
